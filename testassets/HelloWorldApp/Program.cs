@@ -7,6 +7,7 @@ namespace HelloWorldApp
 {
     class Program
     {
+        [STAThread]
         static void Main(string[] args)
         {
             var window = new WebWindow("My great app", options =>
@@ -23,7 +24,10 @@ namespace HelloWorldApp
                 window.SendMessage("Got message: " + message);
             };
 
+            //window.NavigateToString("<h1>Hello</h1>");
+
             window.NavigateToLocalFile("wwwroot/index.html");
+            // window.NavigateToUrl("https://google.com");
             window.WaitForExit();
         }
     }

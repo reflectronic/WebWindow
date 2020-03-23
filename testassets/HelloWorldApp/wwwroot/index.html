@@ -4,7 +4,7 @@
     <p>This is a local file</p>
     <img src="image.png" />
 
-    <p>
+    <p id="text">
         <button onclick="callDotNet()">Call .NET</button>
     </p>
 
@@ -12,7 +12,12 @@
 
     <script>
         function callDotNet() {
+            document.body.remove();
+            document.getElementById("text").textContent += window.external.sendMessage == undefined;
+
             window.external.sendMessage('blah😋');
+            alert('ok');
+
         }
 
         window.external.receiveMessage(function (message) {

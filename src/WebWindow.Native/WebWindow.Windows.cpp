@@ -1,16 +1,35 @@
 #include "WebWindow.h"
-#include <stdio.h>
+#include <iostream>
 #include <map>
 #include <mutex>
 #include <condition_variable>
+#include <filesystem>
+#include <algorithm>
 #include <comdef.h>
 #include <atomic>
 #include <Shlwapi.h>
+#include <pathcch.h>
+
+#include <winrt/base.h>
+#include <winrt/Windows.Foundation.Collections.h>
+#include <winrt/Windows.Web.UI.Interop.h>
+#include <winrt/Windows.Web.Http.Headers.h>
+#include <winrt/Windows.Storage.Streams.h>
+#include <winrt/Windows.UI.Popups.h>
 
 #define WM_USER_SHOWMESSAGE (WM_USER + 0x0001)
 #define WM_USER_INVOKE (WM_USER + 0x0002)
 
 using namespace Microsoft::WRL;
+
+using namespace winrt::Windows::Foundation;
+using namespace winrt::Windows::Storage;
+using namespace winrt::Windows::Storage::Streams;
+using namespace winrt::Windows::Web::Http;
+using namespace winrt::Windows::Web::Http::Headers;
+using namespace winrt::Windows::Web::UI;
+using namespace winrt::Windows::Web::UI::Interop;
+using namespace winrt::Windows::UI::Popups;
 
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
 LPCWSTR CLASS_NAME = L"WebWindow";
@@ -31,6 +50,23 @@ struct ShowMessageParams
 	std::wstring body;
 	UINT type;
 };
+
+Rect HwndWindowRectToBoundsRect(_In_ HWND hwnd)
+{
+	RECT windowRect = { 0 };
+	GetWindowRect(hwnd, &windowRect);
+
+	Rect bounds =
+	{
+		0,
+		0,
+		static_cast<float>(windowRect.right - windowRect.left),
+		static_cast<float>(windowRect.bottom - windowRect.top)
+	};
+
+	return bounds;
+}
+
 
 void WebWindow::Register(HINSTANCE hInstance)
 {
@@ -148,6 +184,10 @@ void WebWindow::RefitContent()
 		GetClientRect(_hWnd, &bounds);
 		_webviewWindow->put_Bounds(bounds);
 	}
+	else if (_edgeWebViewWindow)
+	{
+		_edgeWebViewWindow.Bounds(HwndWindowRectToBoundsRect(_hWnd));
+	}
 }
 
 void WebWindow::SetTitle(AutoString title)
@@ -203,6 +243,85 @@ void WebWindow::Invoke(ACTION callback)
 
 void WebWindow::AttachWebView()
 {
+	if (true /*&& !AttachWebViewChromium()*/)
+	{
+		AttachWebViewEdge();
+	}
+}
+
+void WebWindow::AttachWebViewEdge()
+{
+	std::atomic_flag flag = ATOMIC_FLAG_INIT;
+	flag.test_and_set();
+
+	winrt::init_apartment(winrt::apartment_type::single_threaded);
+	WebViewControlProcessOptions options;
+	options.PrivateNetworkClientServerCapability(WebViewControlProcessCapabilityState::Enabled);
+	WebViewControlProcess process(options);
+
+	process.CreateWebViewControlAsync(reinterpret_cast<int64_t>(_hWnd), HwndWindowRectToBoundsRect(_hWnd)).Completed([&, this](IAsyncOperation<WebViewControl> operation, AsyncStatus)
+		{
+			_edgeWebViewWindow = operation.GetResults();
+			_edgeWebViewWindow.AddInitializeScript(
+				LR"("
+document.body.remove();
+let delegate = document.createDocumentFragment();
+let realExternal = window.external;
+window.external = {
+    sendMessage: (message) => realExternal.notify(message),
+    receiveMessage: (callback) => delegate.addEventListener("receiveMessage", e => callback(e.detail)),
+    postMessage: (message) => delegate.dispatchEvent(new CustomEvent("receiveMessage", { detail: message }))
+};")");
+
+			_edgeWebViewWindow.Settings().IsScriptNotifyAllowed(true);
+			_edgeWebViewWindow.Settings().IsIndexedDBEnabled(true);
+
+			_edgeWebViewWindow.ScriptNotify([this](IWebViewControl const&, WebViewControlScriptNotifyEventArgs const& args)
+				{
+					exit(0);
+					_webMessageReceivedCallback(args.Value().c_str());
+				});
+
+			_edgeWebViewWindow.WebResourceRequested([this](IWebViewControl const&, WebViewControlWebResourceRequestedEventArgs const& args)
+				{
+					std::cout << "Hello, world!";
+					std::wstring scheme{ args.Request().RequestUri().SchemeName() };
+					WebResourceRequestedCallback handler = _schemeToRequestHandler[scheme];
+					if (handler)
+					{
+						int bytes;
+						AutoString contentType;
+						uint8_t* dotNetResponse = reinterpret_cast<uint8_t*>(handler(scheme.c_str(), &bytes, &contentType));
+
+						if (dotNetResponse && contentType)
+						{
+							HttpResponseMessage response = HttpResponseMessage(HttpStatusCode::Ok);
+
+							DataWriter writer;
+							writer.WriteBytes(winrt::array_view<const uint8_t>(dotNetResponse, dotNetResponse + bytes));
+
+							HttpBufferContent content = HttpBufferContent(writer.DetachBuffer());
+							content.Headers().ContentType(HttpMediaTypeHeaderValue(winrt::hstring(contentType)));
+							args.Response(response);
+						}
+					}
+				});
+
+			RefitContent();
+			flag.clear();
+		});
+
+	MSG msg{ 0 };
+	while (flag.test_and_set() && GetMessage(&msg, NULL, 0, 0))
+	{
+		TranslateMessage(&msg);
+		DispatchMessage(&msg);
+	}
+}
+
+bool WebWindow::AttachWebViewChromium()
+{
+	return false;
 	std::atomic_flag flag = ATOMIC_FLAG_INIT;
 	flag.test_and_set();
 
@@ -212,7 +331,7 @@ void WebWindow::AttachWebView()
 				HRESULT envResult = env->QueryInterface(&_webviewEnvironment);
 				if (envResult != S_OK)
 				{
-					return envResult;
+					return false;
 				}
 
 				// Create a WebView, whose parent is the main window hWnd
@@ -231,7 +350,7 @@ void WebWindow::AttachWebView()
 						Settings->put_IsWebMessageEnabled(TRUE);
 
 						// Register interop APIs
-						EventRegistrationToken webMessageToken;
+						::EventRegistrationToken webMessageToken;
 						_webviewWindow->AddScriptToExecuteOnDocumentCreated(L"window.external = { sendMessage: function(message) { window.chrome.webview.postMessage(message); }, receiveMessage: function(callback) { window.chrome.webview.addEventListener(\'message\', function(e) { callback(e.data); }); } };", nullptr);
 						_webviewWindow->add_WebMessageReceived(Callback<IWebView2WebMessageReceivedEventHandler>(
 							[this](IWebView2WebView* webview, IWebView2WebMessageReceivedEventArgs* args) -> HRESULT {
@@ -241,7 +360,7 @@ void WebWindow::AttachWebView()
 								return S_OK;
 							}).Get(), &webMessageToken);
 
-						EventRegistrationToken webResourceRequestedToken;
+						::EventRegistrationToken webResourceRequestedToken;
 						_webviewWindow->AddWebResourceRequestedFilter(L"*", WEBVIEW2_WEB_RESOURCE_CONTEXT_ALL);
 						_webviewWindow->add_WebResourceRequested(Callback<IWebView2WebResourceRequestedEventHandler>(
 							[this](IWebView2WebView* sender, IWebView2WebResourceRequestedEventArgs* args)
@@ -291,36 +410,87 @@ void WebWindow::AttachWebView()
 
 	if (envResult != S_OK)
 	{
-		_com_error err(envResult);
-		LPCTSTR errMsg = err.ErrorMessage();
-		MessageBox(_hWnd, errMsg, L"Error instantiating webview", MB_OK);
+		return false;
+	}
+
+	MSG msg{ 0 };
+	while (flag.test_and_set() && GetMessage(&msg, NULL, 0, 0))
+	{
+		TranslateMessage(&msg);
+		DispatchMessage(&msg);
+	}
+
+	return true;
+}
+
+
+void WebWindow::NavigateToUrl(AutoString url)
+{
+	if (_webviewWindow)
+	{
+		_webviewWindow->Navigate(url);
 	}
 	else
 	{
-		// Block until it's ready. This simplifies things for the caller, so they
-		// don't need to regard this process as async.
-		MSG msg = { };
-		while (flag.test_and_set() && GetMessage(&msg, NULL, 0, 0))
+		Uri uri{ winrt::hstring(url) };
+		if (uri.SchemeName() == L"file")
 		{
-			TranslateMessage(&msg);
-			DispatchMessage(&msg);
+			struct Resolver : winrt::implements<Resolver, winrt::Windows::Web::IUriToStreamResolver>
+			{
+				IAsyncOperation<IInputStream> UriToStreamAsync(Uri uri)
+				{
+					std::wstring s{ uri.Path().c_str() };
+					std::replace(s.begin(), s.end(), '/', '\\');
+					std::wstring_view v = s;
+					v.remove_prefix(v[0] == L'\\' ? 1 : 0);
+
+					StorageFile file = co_await StorageFile::GetFileFromPathAsync(winrt::hstring(v));
+					co_return co_await file.OpenAsync(FileAccessMode::Read);
+				}
+			};
+
+			// WebView doesn't understand the file URI, so we need to give it some help.
+
+			auto resolver = winrt::make<Resolver>();
+			try
+			{
+				auto newUri = _edgeWebViewWindow.BuildLocalStreamUri(L"file", uri.Path());
+				_edgeWebViewWindow.NavigateToLocalStreamUri(newUri, resolver);
+			}
+			catch (winrt::hresult_error const& ex)
+			{
+				MessageBox(_hWnd, ex.message().c_str(), L"Error", 0);
+			}
+		}
+		else
+		{
+			_edgeWebViewWindow.Navigate(uri);
 		}
 	}
 }
 
-void WebWindow::NavigateToUrl(AutoString url)
-{
-	_webviewWindow->Navigate(url);
-}
-
 void WebWindow::NavigateToString(AutoString content)
 {
-	_webviewWindow->NavigateToString(content);
+	if (_webviewWindow)
+	{
+		_webviewWindow->NavigateToString(content);
+	}
+	else
+	{
+		_edgeWebViewWindow.NavigateToString(winrt::hstring(content));
+	}
 }
 
 void WebWindow::SendMessage(AutoString message)
 {
-	_webviewWindow->PostWebMessageAsString(message);
+	if (_webviewWindow)
+	{
+		_webviewWindow->PostWebMessageAsString(message);
+	}
+	else
+	{
+		_edgeWebViewWindow.InvokeScriptAsync(L"window.external.postMessage", { winrt::hstring(message) });
+	}
 }
 
 void WebWindow::AddCustomScheme(AutoString scheme, WebResourceRequestedCallback requestHandler)
@@ -349,7 +519,7 @@ void WebWindow::SetSize(int width, int height)
 	SetWindowPos(_hWnd, HWND_TOP, 0, 0, width, height, SWP_NOMOVE | SWP_NOZORDER);
 }
 
-BOOL MonitorEnum(HMONITOR monitor, HDC, LPRECT, LPARAM arg)
+BOOL __stdcall MonitorEnum(HMONITOR monitor, HDC, LPRECT, LPARAM arg)
 {
 	auto callback = (GetAllMonitorsCallback)arg;
 	MONITORINFO info = {};

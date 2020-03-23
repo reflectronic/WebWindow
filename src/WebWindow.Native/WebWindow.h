@@ -8,6 +8,7 @@
 #include <string>
 #include <wil/com.h>
 #include <WebView2.h>
+#include <winrt/Windows.Web.UI.Interop.h>
 typedef const wchar_t* AutoString;
 #else
 #ifdef OS_LINUX
@@ -42,10 +43,14 @@ private:
 	static HINSTANCE _hInstance;
 	HWND _hWnd;
 	WebWindow* _parent;
+
+	winrt::Windows::Web::UI::Interop::WebViewControl _edgeWebViewWindow{ nullptr };
 	wil::com_ptr<IWebView2Environment3> _webviewEnvironment;
 	wil::com_ptr<IWebView2WebView5> _webviewWindow;
 	std::map<std::wstring, WebResourceRequestedCallback> _schemeToRequestHandler;
 	void AttachWebView();
+	bool AttachWebViewChromium();
+	void AttachWebViewEdge();
 #elif OS_LINUX
 	GtkWidget* _window;
 	GtkWidget* _webview;
