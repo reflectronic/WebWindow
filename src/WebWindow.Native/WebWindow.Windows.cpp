@@ -15,7 +15,7 @@
 #include <winrt/Windows.Web.UI.Interop.h>
 #include <winrt/Windows.Web.Http.Headers.h>
 #include <winrt/Windows.Storage.Streams.h>
-#include <winrt/Windows.UI.Popups.h>
+#include <winrt/Windows.Security.Cryptography.h>
 
 #define WM_USER_SHOWMESSAGE (WM_USER + 0x0001)
 #define WM_USER_INVOKE (WM_USER + 0x0002)
@@ -53,8 +53,8 @@ struct ShowMessageParams
 
 Rect HwndWindowRectToBoundsRect(_In_ HWND hwnd)
 {
-	RECT windowRect = { 0 };
-	GetWindowRect(hwnd, &windowRect);
+	RECT windowRect{ 0 };
+	GetClientRect(hwnd, &windowRect);
 
 	Rect bounds =
 	{
@@ -243,7 +243,7 @@ void WebWindow::Invoke(ACTION callback)
 
 void WebWindow::AttachWebView()
 {
-	if (true /*&& !AttachWebViewChromium()*/)
+	if (true && !AttachWebViewChromium())
 	{
 		AttachWebViewEdge();
 	}
@@ -253,7 +253,6 @@ void WebWindow::AttachWebViewEdge()
 {
 	std::atomic_flag flag = ATOMIC_FLAG_INIT;
 	flag.test_and_set();
-
 	winrt::init_apartment(winrt::apartment_type::single_threaded);
 	WebViewControlProcessOptions options;
 	options.PrivateNetworkClientServerCapability(WebViewControlProcessCapabilityState::Enabled);
@@ -262,9 +261,11 @@ void WebWindow::AttachWebViewEdge()
 	process.CreateWebViewControlAsync(reinterpret_cast<int64_t>(_hWnd), HwndWindowRectToBoundsRect(_hWnd)).Completed([&, this](IAsyncOperation<WebViewControl> operation, AsyncStatus)
 		{
 			_edgeWebViewWindow = operation.GetResults();
+
+			// TODO: This and ScriptNotify appear to not work. Should investigate the behavior of the Community Toolkit's bindings
 			_edgeWebViewWindow.AddInitializeScript(
 				LR"("
-document.body.remove();
+// document.body.remove();
 let delegate = document.createDocumentFragment();
 let realExternal = window.external;
 window.external = {
@@ -273,35 +274,36 @@ window.external = {
     postMessage: (message) => delegate.dispatchEvent(new CustomEvent("receiveMessage", { detail: message }))
 };")");
 
+			auto x = _edgeWebViewWindow.Settings();
+			auto y = x.IsScriptNotifyAllowed();
+
 			_edgeWebViewWindow.Settings().IsScriptNotifyAllowed(true);
 			_edgeWebViewWindow.Settings().IsIndexedDBEnabled(true);
 
 			_edgeWebViewWindow.ScriptNotify([this](IWebViewControl const&, WebViewControlScriptNotifyEventArgs const& args)
 				{
-					exit(0);
 					_webMessageReceivedCallback(args.Value().c_str());
 				});
 
 			_edgeWebViewWindow.WebResourceRequested([this](IWebViewControl const&, WebViewControlWebResourceRequestedEventArgs const& args)
 				{
-					std::cout << "Hello, world!";
 					std::wstring scheme{ args.Request().RequestUri().SchemeName() };
+
 					WebResourceRequestedCallback handler = _schemeToRequestHandler[scheme];
 					if (handler)
 					{
 						int bytes;
 						AutoString contentType;
-						uint8_t* dotNetResponse = reinterpret_cast<uint8_t*>(handler(scheme.c_str(), &bytes, &contentType));
+						uint8_t* dotNetResponse = reinterpret_cast<uint8_t*>(handler(args.Request().RequestUri().ToString().c_str(), &bytes, &contentType));
 
 						if (dotNetResponse && contentType)
 						{
 							HttpResponseMessage response = HttpResponseMessage(HttpStatusCode::Ok);
 
-							DataWriter writer;
-							writer.WriteBytes(winrt::array_view<const uint8_t>(dotNetResponse, dotNetResponse + bytes));
-
-							HttpBufferContent content = HttpBufferContent(writer.DetachBuffer());
+							// TODO: Seems to not work properly. Needed to unlock blazor
+							HttpBufferContent content = HttpBufferContent(winrt::Windows::Security::Cryptography::CryptographicBuffer::CreateFromByteArray(winrt::array_view<const uint8_t>(dotNetResponse, dotNetResponse + bytes)));
 							content.Headers().ContentType(HttpMediaTypeHeaderValue(winrt::hstring(contentType)));
+
 							args.Response(response);
 						}
 					}
@@ -331,7 +333,7 @@ bool WebWindow::AttachWebViewChromium()
 				HRESULT envResult = env->QueryInterface(&_webviewEnvironment);
 				if (envResult != S_OK)
 				{
-					return false;
+					return envResult;
 				}
 
 				// Create a WebView, whose parent is the main window hWnd
@@ -433,12 +435,16 @@ void WebWindow::NavigateToUrl(AutoString url)
 	else
 	{
 		Uri uri{ winrt::hstring(url) };
+		// WebView doesn't understand the file URI, so we need to give it some help.
+		// Probably want to somehow reconcile this with the custom scheme support.
 		if (uri.SchemeName() == L"file")
 		{
 			struct Resolver : winrt::implements<Resolver, winrt::Windows::Web::IUriToStreamResolver>
 			{
 				IAsyncOperation<IInputStream> UriToStreamAsync(Uri uri)
 				{
+					std::wcout << L"Requesting stream resource " << uri.ToString().c_str() << std::endl;
+
 					std::wstring s{ uri.Path().c_str() };
 					std::replace(s.begin(), s.end(), '/', '\\');
 					std::wstring_view v = s;
@@ -449,18 +455,9 @@ void WebWindow::NavigateToUrl(AutoString url)
 				}
 			};
 
-			// WebView doesn't understand the file URI, so we need to give it some help.
-
 			auto resolver = winrt::make<Resolver>();
-			try
-			{
-				auto newUri = _edgeWebViewWindow.BuildLocalStreamUri(L"file", uri.Path());
-				_edgeWebViewWindow.NavigateToLocalStreamUri(newUri, resolver);
-			}
-			catch (winrt::hresult_error const& ex)
-			{
-				MessageBox(_hWnd, ex.message().c_str(), L"Error", 0);
-			}
+			auto newUri = _edgeWebViewWindow.BuildLocalStreamUri(L"file", uri.Path());
+			_edgeWebViewWindow.NavigateToLocalStreamUri(newUri, resolver);
 		}
 		else
 		{

@@ -15,7 +15,7 @@ namespace HelloWorldApp
                 options.SchemeHandlers.Add("app", (string url, out string contentType) =>
                 {
                     contentType = "text/javascript";
-                    return new MemoryStream(Encoding.UTF8.GetBytes("alert('super')"));
+                    return new MemoryStream(Encoding.UTF8.GetBytes("document.body.remove()"));
                 });
             });
 
